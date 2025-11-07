@@ -6,7 +6,7 @@ import pyreadr
 from typing import Optional
 from typing import Union
 import numpy as np
-
+import matplotlib.pyplot as plt
 REQUIRED_COLS = [
     'date','time_m','sym_root','sym_suffix','ex','bid','bidsiz','ask','asksiz',
     'best_bidex','best_bid','best_bidsiz','best_askex','best_ask','best_asksiz',
@@ -84,27 +84,199 @@ def clean_and_enrich(df: pd.DataFrame, symbol: str = "AAPL") -> pd.DataFrame:
 
 
 class AlphaCalculator:
-    """Alpha formula container for easy extension.
+    """Alpha formula container.
 
-    Add new methods as `alpha_<name>(mid: pd.Series) -> pd.Series`.
+    Implement alphas as `alpha_<name>(df, **ctx) -> pd.Series` returning RAW series.
+    Use `score(raw)` to transform raw alpha into a bounded score.
     """
 
-    def __init__(self, clip: float = 0.02):
-        self.clip = float(clip)
 
-    def alpha_mid_pct(self, mid: pd.Series) -> pd.Series:
-        """alpha = mid.pct_change().clip(-clip, clip).fillna(0)"""
-        return mid.pct_change().clip(-self.clip, self.clip).fillna(0)
 
-    def compute(self, name: str, mid: pd.Series) -> pd.Series:
+    # ----- Utilities -----
+    @staticmethod
+    def _rolling_std(s: pd.Series, w: int) -> pd.Series:
+        sd = s.rolling(w, min_periods=max(10, w // 6)).std().shift(1)
+        return sd.mask((sd.isna()) | (sd < 1e-12), 1e-12)
+
+    @staticmethod
+    def score(raw: pd.Series, std: Union[pd.Series, float, int], k: float = 3.0) -> pd.Series:
+        if not isinstance(std, pd.Series):
+            std = pd.Series(float(std), index=raw.index)
+        std = std.mask((std.isna()) | (std < 1e-12), 1e-12)
+        return np.tanh(raw / (k * std))
+
+    # ----- Precompute context -----
+    def _ctx(self, df: pd.DataFrame, *, window: int, tick: float, jump_ticks: int) -> dict:
+        mid = df['mid']
+        spread = df['spread']
+        bid = df.get('best_bid', mid)
+        ask = df.get('best_ask', mid)
+        bidsiz = df.get('best_bidsiz', pd.Series(0.0, index=df.index))
+        asksiz = df.get('best_asksiz', pd.Series(0.0, index=df.index))
+        total_sz = (bidsiz + asksiz).replace(0, np.nan)
+        ret = mid.pct_change()
+        dmid = mid.diff()
+
+        spread_ma = spread.rolling(window).mean().shift(1)
+
+        weights = (bidsiz + asksiz).fillna(0.0)
+        vwap_num = (mid * weights).rolling(window).sum().shift(1)
+        vwap_den = weights.rolling(window).sum().shift(1).replace(0, np.nan)
+        vwap_past = (vwap_num / vwap_den).fillna(method='bfill')
+
+        quotes = df.get('quote_count', pd.Series(0.0, index=df.index))
+        quotes_w = quotes.rolling(window).sum().shift(1).fillna(0.0)
+        quote_arrival_rate = quotes_w / float(window)
+        quote_lifetime = (window / quotes_w.replace(0.0, np.nan)).fillna(method='bfill')
+
+        dir1 = np.sign(dmid)
+        next_dir_up = (dir1.shift(-1) > 0).astype(float)
+        down_now = (dir1 < 0).astype(float)
+        trans_num = (next_dir_up * down_now).rolling(window).sum().shift(1)
+        trans_den = down_now.rolling(window).sum().shift(1).replace(0, np.nan)
+        ba_trans_prob = (trans_num / trans_den).fillna(0.0)
+
+        jump = ((dmid.abs() >= (jump_ticks * tick)) & (dir1 == dir1.shift(1)) & (dir1 != 0)).astype(float)
+        price_jump_intensity = jump.rolling(window).sum().shift(1).fillna(0.0)
+
+        dq_bid = bidsiz.diff()
+        dq_ask = asksiz.diff()
+        dp_bid = bid.diff()
+        dp_ask = ask.diff()
+        ofi_raw = dq_bid.where(dp_bid >= 0, 0.0) - dq_ask.where(dp_ask <= 0, 0.0)
+
+        return dict(
+            mid=mid, spread=spread, bid=bid, ask=ask,
+            bidsiz=bidsiz, asksiz=asksiz, total_sz=total_sz,
+            ret=ret, dmid=dmid, spread_ma=spread_ma,
+            vwap_past=vwap_past,
+            quote_arrival_rate=quote_arrival_rate, quote_lifetime=quote_lifetime,
+            ba_trans_prob=ba_trans_prob,
+            price_jump_intensity=price_jump_intensity,
+            dq_bid=dq_bid, dq_ask=dq_ask,
+            ofi_raw=ofi_raw,
+        )
+
+    # ----- Alpha definitions (RAW) -----
+    def alpha_mid_pct(self, df_or_mid, *, window: int) -> pd.Series:
+        if isinstance(df_or_mid, pd.Series):
+            mid = df_or_mid
+        else:
+            mid = df_or_mid['mid']
+        return mid.pct_change().fillna(0.0)
+
+    def alpha_spread_dev(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        base = (ctx['spread'] - ctx['spread_ma']) / ctx['spread_ma'].replace(0, np.nan)
+        return base.fillna(0.0)
+
+    def alpha_eff_spread(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return (ctx['spread'] / ctx['mid'].replace(0, np.nan)).fillna(0.0)
+
+    def alpha_price_dist_vwap(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ((ctx['mid'] - ctx['vwap_past']) / ctx['spread'].replace(0, np.nan)).fillna(0.0)
+
+    def alpha_liq_imbalance(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ((ctx['bidsiz'] - ctx['asksiz']) / (ctx['bidsiz'] + ctx['asksiz']).replace(0, np.nan)).fillna(0.0)
+
+    def alpha_depth_ratio(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return (ctx['bidsiz'] / ctx['asksiz'].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    def alpha_spread_depth_coupling(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return (ctx['spread'] / (ctx['bidsiz'] + ctx['asksiz']).replace(0, np.nan)).fillna(0.0)
+
+    def alpha_size_vol(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        mean = ctx['total_sz'].rolling(window).mean().shift(1)
+        std = ctx['total_sz'].rolling(window).std().shift(1)
+        return (std / mean.replace(0, np.nan)).fillna(0.0)
+
+    def alpha_ofi(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ctx['ofi_raw'].fillna(0.0)
+
+    def alpha_signed_vol_change(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return (np.sign(ctx['dmid']).fillna(0.0) * (ctx['dq_bid'].fillna(0.0) + ctx['dq_ask'].fillna(0.0))).fillna(0.0)
+
+    def alpha_price_jump_intensity(self, df: pd.DataFrame, *, window: int, tick: float, jump_ticks: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=tick, jump_ticks=jump_ticks)
+        return ctx['price_jump_intensity']
+
+    def alpha_quote_arrival_rate(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ctx['quote_arrival_rate']
+
+    def alpha_quote_lifetime(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ctx['quote_lifetime']
+
+    def alpha_micro_volatility(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ctx['ret'].rolling(window).std().shift(1).fillna(0.0)
+
+    def alpha_realized_spread_decay(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        s = ctx['spread'].shift(1)
+        r = ctx['ret']
+        mean_s = s.rolling(window).mean()
+        mean_r = r.rolling(window).mean()
+        cov = ((s - mean_s) * (r - mean_r)).rolling(window).mean()
+        var_s = ((s - mean_s) ** 2).rolling(window).mean()
+        beta = (cov / var_s.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        return beta.fillna(0.0)
+
+    def alpha_quote_staleness(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        return df.get('quote_staleness', pd.Series(0.0, index=df.index))
+
+    def alpha_ba_transition_prob(self, df: pd.DataFrame, *, window: int) -> pd.Series:
+        ctx = self._ctx(df, window=window, tick=0.01, jump_ticks=1)
+        return ctx['ba_trans_prob']
+
+    # ----- Dispatcher -----
+    def compute(self, name: str, data, **kwargs) -> pd.Series:
         fn = getattr(self, f"alpha_{name}", None)
         if fn is None:
             available = sorted(m.replace('alpha_', '') for m in dir(self) if m.startswith('alpha_'))
             raise ValueError(f"Unknown alpha '{name}'. Available: {available}")
-        return fn(mid)
+        return fn(data, **kwargs)
+
+    def compute_all(self, df: pd.DataFrame, *, window: int, tick: float, jump_ticks: int, names: Optional[list[str]] = None, compress_k: float = 3.0) -> dict[str, pd.Series]:
+        # Known alphas
+        known = [
+            'mid_pct', 'spread_dev', 'eff_spread', 'price_dist_vwap',
+            'liq_imbalance', 'depth_ratio', 'spread_depth_coupling', 'size_vol',
+            'ofi', 'signed_vol_change', 'price_jump_intensity',
+            'quote_arrival_rate', 'quote_lifetime', 'micro_volatility',
+            'realized_spread_decay', 'quote_staleness', 'ba_transition_prob',
+        ]
+        if names is None:
+            names = known
+        else:
+            # ensure we still compute everything for CSV if requested names is subset
+            names = list(dict.fromkeys([*names]))
+
+        out: dict[str, pd.Series] = {}
+        for n in names:
+            raw = self.compute(n, df, window=window, tick=tick, jump_ticks=jump_ticks) if n in {'price_jump_intensity'} else self.compute(n, df, window=window)
+            std = self._rolling_std(raw, window)
+            score = self.score(raw, std, k=compress_k).fillna(0.0)
+            out[f'alpha_{n}'] = score
+        return out
 
 
-def second_snapshot(df: pd.DataFrame, alpha_name: str = 'mid_pct', clip: float = 0.02) -> pd.DataFrame:
+def second_snapshot(
+    df: pd.DataFrame,
+    alpha_name: Union[str, list[str]] = 'mid_pct',
+    window: int = 60,
+    tick: float = 0.01,
+    jump_ticks: int = 1,
+) -> pd.DataFrame:
     # Per-second last quote in each second
     per_sec = df.groupby(df['ts'].dt.floor('S'), as_index=True).last()
 
@@ -118,15 +290,77 @@ def second_snapshot(df: pd.DataFrame, alpha_name: str = 'mid_pct', clip: float =
     full_index = pd.date_range(per_sec.index.min(), per_sec.index.max(), freq='S')
     per_sec = per_sec.reindex(full_index)
 
-    per_sec[['mid', 'micro', 'spread']] = per_sec[['mid', 'micro', 'spread']].ffill(limit=3)
+    # Forward-fill core fields and sizes/prices needed for advanced alphas
+    cols_ffill = ['mid', 'micro', 'spread', 'best_bid', 'best_ask', 'best_bidsiz', 'best_asksiz']
+    existing = [c for c in cols_ffill if c in per_sec.columns]
+    per_sec[existing] = per_sec[existing].ffill(limit=3)
 
-    # Compute features via alpha calculator
-    calc = AlphaCalculator(clip=clip)
-    alpha = calc.compute(alpha_name, per_sec['mid'])
-    vol = alpha.rolling(60).std().bfill()
+    # Quote counts per second and staleness
+    per_sec_count = df.groupby(df['ts'].dt.floor('S')).size().reindex(full_index, fill_value=0)
+    time_index_series = pd.Series(full_index, index=full_index)
+    last_update_time = time_index_series.where(per_sec_count > 0).ffill()
+    staleness_sec = (time_index_series - last_update_time).dt.total_seconds().astype(float)
 
-    out = per_sec[['mid', 'micro', 'spread']].copy()
-    out['alpha'] = alpha
+    # Compute features via alpha calculator (supports multiple alpha names)
+    calc = AlphaCalculator()
+    if isinstance(alpha_name, str):
+        names = [n.strip() for n in alpha_name.split(',') if n.strip()]
+    else:
+        names = list(alpha_name)
+
+    base_cols = [c for c in ['mid','micro','spread','best_bid','best_ask','best_bidsiz','best_asksiz'] if c in per_sec.columns]
+    out = per_sec[base_cols].copy()
+    out['quote_count'] = per_sec_count.astype(float)
+    out['quote_staleness'] = staleness_sec.fillna(0.0)
+
+    # Compute all alphas via AlphaCalculator and 3-sigma scoring
+    # Always compute full set for CSV; use provided names only for the composite average
+    all_alpha = calc.compute_all(out, window=window, tick=tick, jump_ticks=jump_ticks, names=None, compress_k=3.0)
+    for col, ser in all_alpha.items():
+        out[col] = ser
+    alpha_cols = sorted(all_alpha.keys())
+
+    # Determine which alphas to combine for composite
+    # Supports weights via: name:weight or name*weight (e.g., eff_spread:-0.5 or ofi*2)
+    def _parse_alpha_and_weights(spec: Union[str, list[str]]) -> tuple[list[str], dict[str, float]]:
+        names: list[str] = []
+        weights: dict[str, float] = {}
+        tokens = [t.strip() for t in (spec.split(',') if isinstance(spec, str) else spec) if t and t.strip()]
+        for t in tokens:
+            if ':' in t:
+                n, w = t.split(':', 1)
+            elif '*' in t:
+                n, w = t.split('*', 1)
+            else:
+                n, w = t, '1'
+            n = n.strip()
+            try:
+                weights[n] = float(w)
+            except Exception:
+                weights[n] = 1.0
+            names.append(n)
+        return names, weights
+
+    sel_names, sel_weights = _parse_alpha_and_weights(alpha_name)
+    sel_cols = [(n, f'alpha_{n}') for n in sel_names if f'alpha_{n}' in out.columns]
+    if sel_cols:
+        num = None
+        denom = 0.0
+        for n, col in sel_cols:
+            w = float(sel_weights.get(n, 1.0))
+            if num is None:
+                num = w * out[col]
+            else:
+                num = num + w * out[col]
+            denom += abs(w)
+        if denom <= 1e-12 or num is None:
+            out['alpha'] = 0.0
+        else:
+            out['alpha'] = (num / denom).clip(-1.0, 1.0)
+    else:
+        out['alpha'] = out[alpha_cols].mean(axis=1, skipna=True) if alpha_cols else 0.0
+
+    vol = out['alpha'].rolling(window).std().bfill()
     out['vol'] = vol
     out.index.name = 'ts'
     return out
@@ -145,6 +379,7 @@ def backtest_mm(
     qmax: int = 2000,
     plot: bool = True,
     max_fills_per_sec: int = 1,
+    alpha_names: Optional[Union[str, list[str]]] = None,
 ) -> pd.DataFrame:
     """Simple per-second market making backtest using cross-tick fills.
 
@@ -159,9 +394,11 @@ def backtest_mm(
     for col in ['ts', 'best_bid', 'best_ask']:
         if col not in ticks.columns:
             raise KeyError(f"ticks is missing required column: {col}")
-    for col in ['mid', 'micro', 'alpha', 'vol']:
+    for col in ['mid', 'micro', 'vol']:
         if col not in snap.columns:
             raise KeyError(f"snapshot is missing required column: {col}")
+    if not (('alpha' in snap.columns) or any(c.startswith('alpha_') for c in snap.columns)):
+        raise KeyError("snapshot must contain 'alpha' or at least one 'alpha_*' column")
 
     rows = []
 
@@ -176,19 +413,18 @@ def backtest_mm(
 
     snap['mid_diff'] = snap['mid'].diff()
 
-    # 前 120 秒滚动 std（min_periods=60 可按需调），并 shift(1) 防未来函数
     snap['sigma_2m'] = (
         snap['mid_diff']
         .rolling(120, min_periods=60)
         .std()
         .shift(1)
-    )
-    snap['alpha_std_60'] = (
-        snap['alpha']
-        .rolling(60, min_periods=10)
-        .std()
-        .shift(1)
-    )
+    )    # Ensure a combined alpha (already scored in snapshot). Fallback if missing.
+    alpha_cols = [c for c in snap.columns if c.startswith('alpha_') and c != 'alpha']
+    if 'alpha' not in snap.columns:
+        if alpha_cols:
+            snap['alpha'] = snap[alpha_cols].mean(axis=1, skipna=True).fillna(0.0)
+        else:
+            snap['alpha'] = 0.0
     for t in idx:
         micro = snap.at[t, 'micro'] if pd.notna(snap.at[t, 'micro']) else snap.at[t, 'mid']
         a = snap.at[t, 'alpha']
@@ -197,18 +433,12 @@ def backtest_mm(
             v = 0.0
         if pd.isna(a):
             a = 0.0
-        # Use precomputed, label-indexed rolling std to avoid .iloc with Timestamp
-        std_alpha = snap.at[t, 'alpha_std_60']
-        if np.isnan(std_alpha) or std_alpha < 1e-12:
-            std_alpha = 1e-12
+        # alpha already scored in snapshot; clip defensively to [-1,1]
+        score = float(np.clip(a, -1.0, 1.0))
 
-        # 2️⃣ alpha → [-1,1] 的 score (4σ 压缩)
-        score = np.tanh(a / (4 * std_alpha))
-
-        # 3️⃣ 公平价偏移
-        tau = 10.0  # 时间窗口（秒）
+        # 3️⃣
+        tau = 10.0
         m = c * score * v * np.sqrt(tau)
-
         # 4️⃣ 库存风险修正
         beta = 20 * tick / qmax  # 极限20个depth
         skew = m - beta * q
@@ -259,17 +489,116 @@ def backtest_mm(
 
     bt = pd.DataFrame(rows)
 
+    # Compute alpha win rates against next-mid direction
+    try:
+        def _compute_win_rate(pred: pd.Series, mid: pd.Series) -> tuple[float, int]:
+            future = mid.shift(-1) - mid
+            s_future = np.sign(future)
+            s_pred = np.sign(pred)
+            valid = (s_future != 0) & (s_pred != 0) & s_future.notna() & s_pred.notna()
+            n = int(valid.sum())
+            if n == 0:
+                return float('nan'), 0
+            rate = float((s_future[valid] == s_pred[valid]).mean())
+            return rate, n
+
+        # Determine selected alpha component columns (with optional weights)
+        all_alpha_cols = sorted([c for c in snap.columns if c.startswith('alpha_') and c != 'alpha'])
+
+        def _parse_weight_spec(spec) -> tuple[list[str], dict[str, float]]:
+            if spec is None:
+                return [], {}
+            if isinstance(spec, list):
+                tokens = [str(x).strip() for x in spec if str(x).strip()]
+            else:
+                tokens = [t.strip() for t in str(spec).split(',') if t.strip()]
+            names: list[str] = []
+            weights: dict[str, float] = {}
+            for t in tokens:
+                if ':' in t:
+                    n, w = t.split(':', 1)
+                elif '*' in t:
+                    n, w = t.split('*', 1)
+                else:
+                    n, w = t, '1'
+                n = n.strip()
+                try:
+                    weights[n] = float(w)
+                except Exception:
+                    weights[n] = 1.0
+                names.append(n)
+            return names, weights
+
+        sel_names, weight_map = _parse_weight_spec(alpha_names)
+        if sel_names:
+            sel_cols = [(n, f'alpha_{n}', float(weight_map.get(n, 1.0))) for n in sel_names if f'alpha_{n}' in snap.columns]
+        else:
+            sel_cols = [(c.replace('alpha_',''), c, 1.0) for c in all_alpha_cols]
+
+        win_rates: list[tuple[str, float, int]] = []
+        # Composite alpha
+        if 'alpha' in snap.columns:
+            wr, n = _compute_win_rate(snap['alpha'], snap['mid'])
+            win_rates.append(('alpha(composite)', wr, n))
+        # Component alphas (respect sign of weights by multiplying prediction)
+        for name, col, w in sel_cols:
+            wr, n = _compute_win_rate(w * snap[col], snap['mid'])
+            label = f"{col} (w={w:+g})"
+            win_rates.append((label, wr, n))
+    except Exception as _:
+        win_rates = []
+    print()
     if plot and not bt.empty:
         try:
-            import matplotlib.pyplot as plt
-            fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-            ax[0].plot(bt['ts'], bt['equity'], label='Equity')
-            ax[0].set_ylabel('Equity')
-            ax[0].legend(loc='best')
-            ax[1].plot(bt['ts'], bt['q'], label='Inventory', color='tab:orange')
-            ax[1].set_ylabel('Inventory (q)')
-            ax[1].legend(loc='best')
-            ax[1].set_xlabel('Time')
+            # 横轴：优先使用 ts 列，否则 index
+            x = bt['ts'] if 'ts' in bt.columns else bt.index
+
+            # 固定三行：Equity / Inventory / Win Rates
+            fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True,
+                                     gridspec_kw={'height_ratios': [3, 2, 1]})
+            try:
+                fig.set_dpi(150)
+            except Exception:
+                pass
+
+            axes = np.atleast_1d(axes).ravel()
+
+            # === 1) Equity ===
+            axes[0].plot(x, bt['equity'], label='Equity', linewidth=1.2)
+            axes[0].set_ylabel('Equity')
+            axes[0].legend(loc='best')
+
+            # === 2) Inventory ===
+            axes[1].plot(x, bt['q'], label='Inventory', color='tab:orange', linewidth=1.2)
+            axes[1].set_ylabel('Inventory (q)')
+            axes[1].legend(loc='best')
+            axes[-1].set_xlabel('Time')
+            for ax_i in axes:
+                try:
+                    ax_i.tick_params(labelsize=10)
+                except Exception:
+                    pass
+
+            # === 3) Win Rate 面板 ===
+            ax_text = axes[2]
+            lines = ["Win rate (next-mid):"]
+            row = []
+            for i, (name, wr, n) in enumerate(win_rates):
+                val = f"{wr * 100:.1f}%" if np.isfinite(wr) else "n/a"
+                row.append(f"{name}: {val} (n={n})")
+                if (i + 1) % 3 == 0:  # 每行显示 3 个
+                    lines.append("   ".join(row))
+                    row = []
+            if row:
+                lines.append("   ".join(row))
+            txt = "\n".join(lines)
+            ax_text.set_axis_off()
+            ax_text.text(
+                0.01, 0.98, txt,
+                va='top', ha='left',
+                fontsize=10, family='monospace',
+                transform=ax_text.transAxes
+            )
             plt.tight_layout()
             plt.show()
         except Exception as e:
@@ -278,55 +607,7 @@ def backtest_mm(
     return bt
 
 
-def backtest_mm_from_path(
-    path: Union[str, Path],
-    symbol: str = "AAPL",
-    *,
-    alpha: str = 'mid_pct',
-    clip: float = 0.02,
-    gamma: float = 0.3,
-    kappa: float = 0.002,
-    delta0: float = 0.01,
-    c: float = 20.0,
-    tick: float = 0.01,
-    qty: int = 100,
-    qmax: int = 2000,
-    plot: bool = True,
-    reset_daily: bool = False,
-) -> pd.DataFrame:
-    """Convenience: load multi-day .rda files from a path and run backtest."""
-    target = Path(path)
-    frames = load_nbbo_frames(target, object_name="nbbo")
-    raw = pd.concat(frames, ignore_index=True) if isinstance(frames, list) and len(frames) > 1 else (frames[0] if isinstance(frames, list) else frames)
-    cleaned = clean_and_enrich(raw, symbol=symbol)
-    snap = second_snapshot(cleaned, alpha_name=alpha, clip=clip)
-    return backtest_mm(
-        ticks=cleaned,
-        snap=snap,
-        gamma=gamma,
-        kappa=kappa,
-        delta0=delta0,
-        c=c,
-        tick=tick,
-        qty=qty,
-        qmax=qmax,
-        plot=plot,
-        reset_daily=reset_daily,
-    )
-def run(path: Optional[str] = None,
-        symbol: str = "AAPL",
-        output: Optional[str] = None,
-        alpha: str = 'mid_pct',
-        clip: float = 0.02) -> pd.DataFrame:
-    target = Path(path) if path else Path(".")
-    frames = load_nbbo_frames(target, object_name="nbbo")
-    raw = pd.concat(frames, ignore_index=True) if isinstance(frames, list) and len(frames) > 1 else (frames[0] if isinstance(frames, list) else frames)
-    cleaned = clean_and_enrich(raw, symbol=symbol)
-    snap = second_snapshot(cleaned, alpha_name=alpha, clip=clip)
-    if output:
-        Path(output).parent.mkdir(parents=True, exist_ok=True)
-        snap.to_csv(output, index=False)
-    return snap
+
 
 
 def main():
@@ -334,8 +615,11 @@ def main():
     parser.add_argument("--input", "-i", default=".", help="Path to .rda file or directory (default: .)")
     parser.add_argument("--symbol", "-s", default="AAPL", help="Symbol root to filter (default: AAPL)")
     parser.add_argument("--output", "-o", default="./aapl_snap.csv", help="Optional CSV output path for snapshot")
-    parser.add_argument("--alpha", default="mid_pct", help="Alpha formula name (default: mid_pct)")
-    parser.add_argument("--clip", type=float, default=0.02, help="Clip threshold for alpha (default: 0.02)")
+    parser.add_argument(
+        "--alpha",
+        default="mid_pct",
+        help="Alpha name(s), comma-separated. Supports weights via name:weight or name*weight (e.g., ofi:2,eff_spread:-0.5). Default: mid_pct",
+    )
 
     # Backtest flags and params
     parser.add_argument("--backtest", action="store_true", help="Run market-making backtest")
@@ -357,7 +641,7 @@ def main():
     frames = load_nbbo_frames(target, object_name="nbbo")
     raw = pd.concat(frames, ignore_index=True) if isinstance(frames, list) and len(frames) > 1 else (frames[0] if isinstance(frames, list) else frames)
     cleaned = clean_and_enrich(raw, symbol=args.symbol)
-    snap = second_snapshot(cleaned, alpha_name=args.alpha, clip=args.clip)
+    snap = second_snapshot(cleaned, alpha_name=args.alpha)
 
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -382,6 +666,7 @@ def main():
             plot=(not args.no_plots),
             reset_daily=args.reset_daily,
             max_fills_per_sec=(None if args.max_fills_per_sec == -1 else args.max_fills_per_sec),
+            alpha_names=args.alpha,
         )
         print(bt.head())
         if not bt.empty:
@@ -396,29 +681,39 @@ def main():
 
 if __name__ == "__main__":
     # 手动设置参数
-    input_path = "./"          # .rda 或目录路径
-    symbol = "AAPL"            # 股票代码
+    input_path = "./"
     output_path = "./aapl_snap.csv"
-    alpha = "mid_pct"
-    clip = 0.1
+    # alpha = [
+    #     "mid_pct", "spread_dev", "eff_spread", "price_dist_vwap",
+    #     "liq_imbalance", "depth_ratio", "spread_depth_coupling", "size_vol",
+    #     "ofi", "signed_vol_change", "price_jump_intensity",
+    #     "quote_arrival_rate", "quote_lifetime", "micro_volatility",
+    #     "realized_spread_decay", "quote_staleness", "ba_transition_prob"
+    # ]
+    alpha = [
+        "liq_imbalance",
+        "ofi",
+        "price_dist_vwap:-1"
+    ]
+
 
     # backtest 参数
-    run_backtest = True         # ✅ 改这里控制是否跑回测
+    run_backtest = True
     gamma = 0.03
     kappa = 0.002
     delta0 = 0.01
-    c = 20.0
+    c = 2.0
     tick = 0.01
     qty = 100
     qmax = 2000
     plot = True
-
+    symbol= "AAPL"
     # === Snapshot部分 ===
     target = Path(input_path)
     frames = load_nbbo_frames(target, object_name="nbbo")
     raw = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     cleaned = clean_and_enrich(raw, symbol=symbol)
-    snap = second_snapshot(cleaned, alpha_name=alpha, clip=clip)
+    snap = second_snapshot(cleaned, alpha_name=alpha)
 
     if output_path:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +736,7 @@ if __name__ == "__main__":
             qty=qty,
             qmax=qmax,
             plot=plot,
+            alpha_names=alpha,
         )
         print(bt.head())
         if not bt.empty:
